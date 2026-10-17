@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Vocabulary Flashcard Spaced Repetition Trainer</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  .flip-card{perspective:600px}
+  .flip-inner{transition:transform .5s;transform-style:preserve-3d;position:relative;min-height:180px}
+  .flip-inner.flipped{transform:rotateY(180deg)}
+  .flip-front,.flip-back{backface-visibility:hidden;-webkit-backface-visibility:hidden;position:absolute;width:100%;min-height:180px;border-radius:12px;display:flex;align-items:center;justify-content:center;padding:24px}
+  .flip-back{transform:rotateY(180deg)}
+</style>
+</head>
+<body class="bg-gray-950 text-white min-h-screen">
+<script>
+function escapeHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+
+const STORAGE_KEY='srs_decks_v2';
+const BOX_INTERVALS=[1,2,4,7,Infinity]; // days per box (1-indexed, box5=mastered)
+
+function loadData(){
+  try{return JSON.parse(localStorage.getItem(STORAGE_KEY))||{decks:[]};}
+  catch{return {decks:[]};}
+}
+function saveData(d){localStorage.setItem(STORAGE_KEY,JSON.stringify(d));}
+
+let db=loadData();
+let view='decks'; // decks | deck | study | add-deck | import
+let activeDeck=null;
+let studyQueue=[];
+let studyIndex=0;
+let flipped=false;
+
+function today(){return new Date().toISOString().slice(0,10);}
+function addDays(d,n){const dt=new Date(d);dt.setDate(dt.getDate()+n);return dt.toISOString().slice(0,10);}
+
+function getDueCards(deck){
+  const t=today();
+  return deck.cards.filter(c=>{
+    const box=c.box||1;
+    if(box>=5) return false;
+    const due=c.nextReview||today();
+    return due<=t;
+  });
+}
+
+function buildStudyQueue(deck){
+  return getDueCards(deck);
+}
+
+// ===== VIEWS =====
+function renderDecks(){
+  view='decks';
+  const items=db.decks.map((d,i)=>{
+    const total=d.cards.length;
+    const due=getDueCards(d).length;
+    const mastered=d.cards.filter(c=>(c.box||1)>=5).length;
+    return `<div class="bg-gray-800 rounded-xl p-4 flex items-center justify-between">
+      <div>
+        <div class="font-bold text-lg text-blue-300">${escapeHtml(d.name)}</div>
+        <div class="text-sm text-gray-400">${total} cards · <span class="text-yellow-300">${due} due</span> · <span class="text-green-400">${mastered} mastered</span></div>
+      </div>
+      <div class="flex gap-2">
+        <button onclick="openDeck(${i})" class="bg-blue-700 hover:bg-blue-600 px-3 py-1 rounded text-sm">Open</button>
+        <button onclick="startStudy(${i})" class="bg-green-700 hover:bg-green-600 px-3 py-1 rounded text-sm" ${due===0?'disabled style="opacity:.4"':''}>Study</button>
+        <button onclick="deleteDeck(${i})" class="bg-red-900 hover:bg-red-700 px-2 py-1 rounded text-sm">🗑</button>
+      </div>
+    </div>`;
+  }).join('');
+
+  document.getElementById('app').innerHTML=`
+    <div class="max-w-2xl mx-auto p-6">
+      <h1 class="text-3xl font-bold text-blue-300 mb-6">📚 Flashcard SRS Trainer</h1>
+      <div class="flex gap-2 mb-6">
+        <button onclick="showAddDeck()" class="bg-blue-700 hover:bg-blue-600 px-4 py-2 rounded-lg font-semibold">+ New Deck</button>
+        <button onclick="showImport()" class="bg-purple-700 hover:bg-purple-600 px-4 py-2 rounded-lg font-semibold">Import CSV</button>
+      </div>
+      ${db.decks.length===0?'<div class="text-gray-500 text-center py-12">No decks yet. Create one to get started!</div>':
+        `<div class="flex flex-col gap-3">${items}</div>`}
+      <div class="mt-8 bg-gray-800 rounded-xl p-4 text-sm text-gray-400">
+        <div class="font-semibold text-gray-300 mb-2">Leitner Box Schedule</div>
+        <div class="grid grid-cols-5 gap-1 text-center text-xs">
+          ${[1,2,3,4,5].map(b=>`<div class="bg-gray-700 rounded p-1"><div class="font-bold text-yellow-300">Box ${b}</div><div>${b===5?'Mastered':`Every ${BOX_INTERVALS[b-1]}d`}</div></div>`).join('')}
+        </div>
+      </div>
+    </div>`;
+}
+
+function showAddDeck(){
+  view='add-deck';
+  document.getElementById('app').innerHTML=`
+    <div class="max-w-xl mx-auto p-6">
+      <button onclick="renderDecks()" class="text-gray-400 hover:text-white mb-4">← Back</button>
+      <h2 class="text-2xl font-bold text-blue-300 mb-4">Create New Deck</h2>
+      <input id="deckName" class="w-full bg-gray-800 border border-gray-600 rounded-lg p-3 text-white mb-4" placeholder="Deck name (e.g. Spanish Vocab)">
+      <button onclick="createDeck()" class="bg-blue-600 hover:bg-blue-500 px-6 py-2 rounded-lg font-semibold">Create Deck</button>
+    </div>`;
+}
+
+function createDeck(){
+  const name=document.getElementById('deckName').value.trim();
+  if(!name) return;
+  db.decks.push({name,cards:[]});
+  saveData(db);
+  renderDecks();
+}
+
+function deleteDeck(i){
+  if(!confirm('Delete this deck?')) return;
+  db.decks.splice(i,1);
+  saveData(db);
+  renderDecks();
+}
+
+function openDeck(i){
+  activeDeck=i;
+  view='deck';
+  const deck=db.decks[i];
+  const cardRows=deck.cards.map((c,j)=>`
+    <tr class="border-b border-gray-700">
+      <td class="p-2 text-blue-300">${escapeHtml(c.front)}</td>
+      <td class="p-2 text-gray-300">${escapeHtml(c.back)}</td>
+      <td class="p-2 text-center text-yellow-300 font-bold">${c.box||1}</td>
+      <td class="p-2 text-center text-gray-400 text-xs">${c.nextReview||today()}</td>
+      <td class="p-2 text-center"><button onclick="deleteCard(${i},${j})" class="text-red-400 hover:text-red-300 text-xs">✕</button></td>
+    </tr>`).join('');
+
+  document.getElementById('app').innerHTML=`
+    <div class="max-w-3xl mx-auto p-6">
+      <button onclick="renderDecks()" class="text-gray-400 hover:text-white mb-4">← Decks</button>
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-2xl font-bold text-blue-300">${escapeHtml(deck.name)}</h2>
+        <button onclick="startStudy(${i})" class="bg-green-600 hover:bg-green-500 px-4 py-2 rounded-lg font-semibold" ${getDueCards(deck).length===0?'disabled style="opacity:.4"':''}>Study Now (${getDueCards(deck).length} due)</button>
+      </div>
+      <div class="bg-gray-800 rounded-xl p-4 mb-4">
+        <div class="font-semibold mb-3 text-gray-300">Add New Card</div>
+        <div class="flex flex-col gap-2">
+          <input id="cardFront" class="bg-gray-700 border border-gray-600 rounded-lg p-2 text-white" placeholder="Front (term)">
+          <input id="cardBack" class="bg-gray-700 border border-gray-600 rounded-lg p-2 text-white" placeholder="Back (definition)">
+          <input id="cardNote" class="bg-gray-700 border border-gray-600 rounded-lg p-2 text-white" placeholder="Notes (optional)">
+          <button onclick="addCard(${i})" class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded-lg font-semibold self-start">Add Card</button>
+        </div>
+      </div>
+      ${deck.cards.length>0?`
+      <div class="overflow-x-auto rounded-xl border border-gray-700">
+        <table class="w-full text-sm">
+          <thead><tr class="bg-gray-800 text-gray-400"><th class="p-2 text-left">Front</th><th class="p-2 text-left">Back</th><th class="p-2">Box</th><th class="p-2">Next</th><th class="p-2"></th></tr></thead>
+          <tbody>${cardRows}</tbody>
+        </table>
+      </div>`:'<div class="text-gray-500 text-center py-6">No cards yet. Add some above!</div>'}
+    </div>`;
+}
+
+function addCard(i){
+  const f=document.getElementById('cardFront').value.trim();
+  const b=document.getElementById('cardBack').value.trim();
+  const n=document.getElementById('cardNote').value.trim();
+  if(!f||!b) return;
+  db.decks[i].cards.push({front:f,back:b,note:n,box:1,nextReview:today()});
+  saveData(db);
+  openDeck(i);
+}
+
+function deleteCard(di,ci){
+  db.decks[di].cards.splice(ci,1);
+  saveData(db);
+  openDeck(di);
+}
+
+function startStudy(i){
+  activeDeck=i;
+  const deck=db.decks[i];
+  studyQueue=buildStudyQueue(deck);
+  if(studyQueue.length===0){ alert('No cards due today!'); return; }
+  studyIndex=0; flipped=false;
+  renderStudy();
+}
+
+function renderStudy(){
+  view='study';
+  const deck=db.decks[activeDeck];
+  if(studyIndex>=studyQueue.length){
+    document.getElementById('app').innerHTML=`
+      <div class="max-w-xl mx-auto p-6 text-center">
+        <div class="text-5xl mb-4">🎉</div>
+        <h2 class="text-2xl font-bold text-green-300 mb-2">Session Complete!</h2>
+        <p class="text-gray-400 mb-6">You've reviewed all ${studyQueue.length} due cards.</p>
+        <div class="grid grid-cols-5 gap-2 mb-6">
+          ${[1,2,3,4,5].map(b=>`<div class="bg-gray-800 rounded-lg p-3 text-center">
+            <div class="text-yellow-300 font-bold">Box ${b}</div>
+            <div class="text-2xl font-bold">${deck.cards.filter(c=>(c.box||1)===b).length}</div>
+          </div>`).join('')}
+        </div>
+        <button onclick="renderDecks()" class="bg-blue-600 hover:bg-blue-500 px-6 py-3 rounded-xl font-semibold">Back to Decks</button>
+      </div>`;
+    return;
+  }
+  const card=studyQueue[studyIndex];
+  const remaining=studyQueue.length-studyIndex;
+  const boxColors=['bg-red-900','bg-orange-900','bg-yellow-900','bg-blue-900','bg-green-900'];
+
+  document.getElementById('app').innerHTML=`
+    <div class="max-w-xl mx-auto p-6">
+      <div class="flex justify-between items-center mb-4">
+        <button onclick="renderDecks()" class="text-gray-400 hover:text-white">← Exit</button>
+        <span class="text-gray-400 text-sm">${studyIndex+1} / ${studyQueue.length} · <span class="text-yellow-300">${remaining} remaining</span></span>
+      </div>
+      <div class="flip-card cursor-pointer mb-4" onclick="flipCard()">
+        <div class="flip-inner ${flipped?'flipped':''}" id="fi">
+          <div class="flip-front bg-blue-900 border-2 border-blue-500">
+            <div class="text-center">
+              <div class="text-xs text-blue-300 mb-2 uppercase tracking-wide">Term</div>
+              <div class="text-2xl font-bold">${escapeHtml(card.front)}</div>
+              <div class="text-gray-400 text-sm mt-3">Click to reveal</div>
+            </div>
+          </div>
+          <div class="flip-back bg-purple-900 border-2 border-purple-500">
+            <div class="text-center">
+              <div class="text-xs text-purple-300 mb-2 uppercase tracking-wide">Definition</div>
+              <div class="text-xl font-bold mb-2">${escapeHtml(card.back)}</div>
+              ${card.note?`<div class="text-sm text-gray-400 italic">${escapeHtml(card.note)}</div>`:''}
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="text-center text-sm text-gray-400 mb-4">Box ${card.box||1} — click card to flip</div>
+      ${flipped?`<div class="grid grid-cols-2 gap-3">
+        <button onclick="rateCard('hard')" class="bg-red-700 hover:bg-red-600 p-4 rounded-xl font-bold text-lg">😓 Hard<br><span class="text-xs font-normal">Move to Box 1</span></button>
+        <button onclick="rateCard('easy')" class="bg-green-700 hover:bg-green-600 p-4 rounded-xl font-bold text-lg">😊 Easy<br><span class="text-xs font-normal">Advance box</span></button>
+      </div>`:'<div class="text-center text-gray-500 text-sm">Flip the card to rate it</div>'}
+    </div>`;
+}
+
+function flipCard(){ flipped=!flipped; renderStudy(); }
+
+function rateCard(rating){
+  const card=studyQueue[studyIndex];
+  const deckCard=db.decks[activeDeck].cards.find(c=>c.front===card.front&&c.back===card.back);
+  if(deckCard){
+    let box=deckCard.box||1;
+    if(rating==='easy') box=Math.min(5,box+1);
+    else box=1;
+    deckCard.box=box;
+    const interval=BOX_INTERVALS[box-1];
+    deckCard.nextReview=interval===Infinity?'9999-12-31':addDays(today(),interval);
+  }
+  saveData(db);
+  studyIndex++;
+  flipped=false;
+  renderStudy();
+}
+
+function showImport(){
+  view='import';
+  document.getElementById('app').innerHTML=`
+    <div class="max-w-xl mx-auto p-6">
+      <button onclick="renderDecks()" class="text-gray-400 hover:text-white mb-4">← Back</button>
+      <h2 class="text-2xl font-bold text-blue-300 mb-4">Import Cards from CSV</h2>
+      <p class="text-gray-400 text-sm mb-4">Paste "term,definition" lines (one per line). First create or select a deck.</p>
+      <select id="importDeck" class="w-full bg-gray-800 border border-gray-600 rounded-lg p-3 text-white mb-3">
+        ${db.decks.map((d,i)=>`<option value="${i}">${escapeHtml(d.name)}</option>`).join('')}
+        <option value="new">+ Create new deck</option>
+      </select>
+      <input id="importDeckName" class="w-full bg-gray-800 border border-gray-600 rounded-lg p-3 text-white mb-3 hidden" placeholder="New deck name">
+      <textarea id="csvInput" class="w-full bg-gray-800 border border-gray-600 rounded-lg p-3 text-white h-40 mb-3 font-mono text-sm" placeholder="apple,a fruit\nrun,to move quickly\nbeautiful,pleasing to the eye"></textarea>
+      <button onclick="importCards()" class="bg-purple-600 hover:bg-purple-500 px-6 py-2 rounded-lg font-semibold">Import Cards</button>
+    </div>`;
+  document.getElementById('importDeck').addEventListener('change',e=>{
+    document.getElementById('importDeckName').classList.toggle('hidden',e.target.value!=='new');
+  });
+}
+
+function importCards(){
+  const sel=document.getElementById('importDeck').value;
+  const csv=document.getElementById('csvInput').value.trim();
+  if(!csv) return;
+  let deckIdx;
+  if(sel==='new'){
+    const name=document.getElementById('importDeckName').value.trim()||'Imported Deck';
+    db.decks.push({name,cards:[]});
+    saveData(db);
+    deckIdx=db.decks.length-1;
+  } else deckIdx=parseInt(sel);
+  const lines=csv.split('\n');
+  let count=0;
+  lines.forEach(line=>{
+    const parts=line.split(',');
+    if(parts.length>=2){
+      const f=parts[0].trim(); const b=parts.slice(1).join(',').trim();
+      if(f&&b){db.decks[deckIdx].cards.push({front:f,back:b,note:'',box:1,nextReview:today()});count++;}
+    }
+  });
+  saveData(db);
+  alert(`Imported ${count} cards!`);
+  renderDecks();
+}
+</script>
+<div id="app"></div>
+<script>renderDecks();</script>
+</body>
+</html>
